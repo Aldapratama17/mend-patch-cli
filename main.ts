@@ -25,6 +25,7 @@ interface FileChange {
   content?: string;
   lineBreak?: string;
   endsWithBreak?: boolean;
+  isRename?: boolean;
 }
 
 interface FileState {
