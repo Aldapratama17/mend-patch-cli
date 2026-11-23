@@ -318,30 +318,48 @@ class UnifiedDiffEdit {
         // But hunk.oldStart is relative to the original file, so we need to adjust
         // Use max(cursor, hunk.oldStart - 50) to handle non-adjacent hunks
         // When hunk.oldStart is -1 (malformed @@ -0 @@), treat as 0
-        const searchStart = Math.max(0, (hunk.oldStart < 0 ? 0 : hunk.oldStart) - 50);        
-
-for (const tier of tiers) {
-          // Search in newLines (current state) not file.lines (original)
-          const idx = matchTier(newLines, oldContext, searchStart, tier);
-          if (idx >= 0) {
-            // Check uniqueness at this tier
-            const count = countMatches(newLines, oldContext, tier);
-            if (count === 1) {
-              matchIdx = idx;
-              matchedTier = tier;
-              break;
+        const searchStart = Math.max(cursor, (hunk.oldStart < 0 ? 0 : hunk.oldStart) - 50);        
+        // Find all matches near oldStart
+        const ambStart = Math.max(0, (hunk.oldStart < 0 ? 0 : hunk.oldStart) - 20);
+        const ambEnd = Math.min(newLines.length, ambStart + 60);
+        
+        for (const tier of tiers) {
+          const matches: number[] = [];
+          for (let i = ambStart; i <= ambEnd - oldContext.length; i++) {
+            let ok = true;
+            for (let j = 0; j < oldContext.length; j++) {
+              if (!compareLines(newLines[i + j], oldContext[j], tier)) {
+                ok = false;
+                break;
+              }
             }
+            if (ok) matches.push(i);
+          }
+          
+          if (matches.length === 1) {
+            matchIdx = matches[0];
+            matchedTier = tier;
+            break;
+          } else if (matches.length > 1) {
+            // Pick the one closest to oldStart
+            let bestIdx = matches[0];
+            let bestDist = Math.abs(matches[0] - hunk.oldStart);
+            for (const m of matches) {
+              const dist = Math.abs(m - hunk.oldStart);
+              if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = m;
+              }
+            }
+            matchIdx = bestIdx;
+            matchedTier = tier;
+            break;
           }
         }
       }
       
       if (matchIdx < 0) {
         // Check if ambiguous at any tier
-        for (const tier of tiers) {
-          if (countMatches(newLines, oldContext, tier) > 1) {
-            return { success: false, error: { code: 'ambiguous', path } };
-          }
-        }
         return { success: false, error: { code: 'no-match', path } };
       }
       
@@ -667,6 +685,10 @@ function parseV4A(text: string): Edit[] {
           bodyLines.push(lines[i]);
           i++;
         }
+        // Trim trailing empty/whitespace-only lines from bodyLines
+        while (bodyLines.length > 0 && bodyLines[bodyLines.length - 1].trim() === '') {
+          bodyLines.pop();
+        }
         
         if (bodyLines.length === 0 && !endOfFile && anchor === '') {
           // First chunk can start without @@
@@ -794,22 +816,12 @@ class V4AUpdateEdit {
         for (const tier of tiers) {
           const idx = matchTier(newLines, [chunk.anchor], cursor, tier);
           if (idx >= 0) {
-            // Check uniqueness from cursor onwards
-            const count = countMatchesFrom(newLines, [chunk.anchor], cursor, tier);
-            if (count === 1) {
-              cursor = idx + 1;
-              found = true;
-              break;
-            }
+            cursor = idx + 1;
+            found = true;
+            break;
           }
         }
         if (!found) {
-          // Check if ambiguous from cursor onwards
-          for (const tier of tiers) {
-            if (countMatchesFrom(newLines, [chunk.anchor], cursor, tier) > 1) {
-              return { success: false, error: { code: 'ambiguous', path: this.path } };
-            }
-          }
           return { success: false, error: { code: 'no-match', path: this.path } };
         }
       }
@@ -819,9 +831,12 @@ class V4AUpdateEdit {
       const newContext: string[] = [];
       
       for (const line of chunk.bodyLines) {
-        if (line.startsWith(' ') || line.startsWith('-')) oldContext.push(line.slice(1));
-        if (line.startsWith(' ') || line.startsWith('+')) newContext.push(line.slice(1));
+        if (line.startsWith(' ') || line.startsWith('-')) oldContext.push(line.slice(1).replace(/s+$/, ''));
+        if (line.startsWith(' ') || line.startsWith('+')) newContext.push(line.slice(1).replace(/s+$/, ''));
       }
+      
+      console.error('OLD CONTEXT (trimmed): ' + JSON.stringify(oldContext));
+      console.error('NEW CONTEXT (trimmed): ' + JSON.stringify(newContext));
       
       if (oldContext.length === 0) {
         // Insert at cursor
@@ -830,44 +845,33 @@ class V4AUpdateEdit {
         continue;
       }
       
-      // Find match
+      // Find match - take first occurrence at or after cursor (V4A spec)
       let matchIdx = -1;
       let matchedTier: Tier = 0;
-      
-      console.error('DEBUG: endOfFile=' + chunk.endOfFile + ', cursor=' + cursor + ', oldContext=' + JSON.stringify(oldContext) + ', newLines.length=' + newLines.length);
-      console.error('DEBUG newLines from cursor: ' + JSON.stringify(newLines.slice(cursor, cursor + 10)));
       
       if (chunk.endOfFile) {
         // Must match at end of file
         for (const tier of tiers) {
-          const idx = matchTierDebug(newLines, oldContext, cursor, tier);
-          console.error('DEBUG tier=' + tier + ': matchTier idx=' + idx);
+          const idx = matchTier(newLines, oldContext, cursor, tier);
           if (idx >= 0 && idx + oldContext.length === newLines.length) {
-            // Check uniqueness from cursor
-            const count = countMatchesFrom(newLines, oldContext, cursor, tier);
-            console.error('DEBUG tier=' + tier + ': idx=' + idx + ', count=' + count);
-            if (count === 1) {
-              matchIdx = idx;
-              matchedTier = tier;
-              break;
-            }
+            matchIdx = idx;
+            matchedTier = tier;
+            break;
           }
         }
       } else {
         for (const tier of tiers) {
           const idx = matchTier(newLines, oldContext, cursor, tier);
-          console.error('DEBUG tier=' + tier + ': matchTier idx=' + idx);
           if (idx >= 0) {
-            // Check uniqueness from cursor
-            const count = countMatchesFrom(newLines, oldContext, cursor, tier);
-            console.error('DEBUG tier=' + tier + ': idx=' + idx + ', count=' + count);
-            if (count === 1) {
-              matchIdx = idx;
-              matchedTier = tier;
-              break;
-            }
+            matchIdx = idx;
+            matchedTier = tier;
+            break;
           }
         }
+      }
+      
+      if (matchIdx < 0) {
+        return { success: false, error: { code: 'no-match', path: this.path } };
       }
       
       if (matchIdx < 0) {
