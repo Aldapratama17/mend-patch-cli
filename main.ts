@@ -325,26 +325,31 @@ class UnifiedDiffEdit {
       }
       
       // Build replacement by iterating through hunk lines directly
-      // This correctly handles context lines (preserve original), deletions (skip), and insertions (add new)
+      // Only process up to hunk.oldLines lines from the old file
       const replacement: string[] = [];
       let contextOffset = 0;
+      let oldLinesConsumed = 0;
       for (const line of hunk.lines) {
+        if (oldLinesConsumed >= hunk.oldLines) break;
+        
         if (line.startsWith(' ') || line === '') {
           // Context line: preserve original file's line (including trailing whitespace)
           if (matchIdx + contextOffset < file.lines.length) {
             replacement.push(file.lines[matchIdx + contextOffset]);
           }
           contextOffset++;
+          oldLinesConsumed++;
         } else if (line.startsWith('-')) {
-          // Deleted line: skip, but advance context offset
+          // Deleted line: skip, but advance context offset and count toward oldLines
           contextOffset++;
+          oldLinesConsumed++;
         } else if (line.startsWith('+')) {
-          // Inserted line: add new content
+          // Inserted line: add new content, does NOT count toward oldLines
           replacement.push(line.slice(1));
         }
       }
       
-      // Use hunk.oldLines for the splice count (not oldContext.length which may be trimmed)
+      // Use hunk.oldLines for the splice count
       newLines.splice(matchIdx, hunk.oldLines, ...replacement);
       cursor = matchIdx + replacement.length;
     }
