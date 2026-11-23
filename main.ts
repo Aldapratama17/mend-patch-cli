@@ -696,6 +696,17 @@ function parseV4A(text: string): Edit[] {
       throw new Error(`parse ${i + 1}`);
     }
   }
+  // Check if *** End Patch was found
+  let foundEndPatch = false;
+  for (const line of lines) {
+    if (line.trim() === '*** End Patch') {
+      foundEndPatch = true;
+      break;
+    }
+  }
+  if (!foundEndPatch) {
+    throw new Error('parse 8');
+  }
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
