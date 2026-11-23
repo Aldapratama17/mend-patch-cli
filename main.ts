@@ -120,7 +120,7 @@ function compareLines(a: string, b: string, tier: Tier): boolean {
   if (tier === 0) return a === b;
   if (tier === 1) return a.replace(/\s+$/, '') === b.replace(/\s+$/, '');
   if (tier === 2) return a.trimStart() === b.trimStart();
-  if (tier === 3) return a.replace(/\s/g, '') === b.replace(/\s/g, '');
+  if (tier === 3) return a.replace(/\s+/g, ' ') === b.replace(/\s+/g, ' ');
   return false;
 }
 
