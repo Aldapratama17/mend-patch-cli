@@ -140,21 +140,6 @@ function countMatches(lines: string[], target: string[], tier: Tier): number {
   return count;
 }
 
-function countMatchesFrom(lines: string[], target: string[], start: number, tier: Tier): number {
-  let count = 0;
-  for (let i = start; i <= lines.length - target.length; i++) {
-    let ok = true;
-    for (let j = 0; j < target.length; j++) {
-      if (!compareLines(lines[i + j], target[j], tier)) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) count++;
-  }
-  return count;
-}
-
 // ============================================================================
 // Unified diff parsing
 // ============================================================================
@@ -513,7 +498,7 @@ function parseSearchReplace(text: string): Edit[] {
       i++;
     }
   }
-  
+
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
@@ -711,21 +696,6 @@ function parseV4A(text: string): Edit[] {
       throw new Error(`parse ${i + 1}`);
     }
   }
-
-  // Must have *** End Patch
-  let foundEndPatch = false;
-  for (let j = 0; j < lines.length; j++) {
-    if (lines[j].trim() === '*** End Patch') {
-      foundEndPatch = true;
-      break;
-    }
-  }
-  if (!foundEndPatch) {
-    // Count actual patch lines: number of \n in text, plus 1 if doesn't end with \n
-    const patchLines = text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length;
-    throw new Error(`parse ${patchLines + 1}`);
-  }
-
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
@@ -825,12 +795,22 @@ class V4AUpdateEdit {
         for (const tier of tiers) {
           const idx = matchTier(newLines, [chunk.anchor], cursor, tier);
           if (idx >= 0) {
-            cursor = idx + 1;
-            found = true;
-            break;
+            // Check uniqueness
+            const count = countMatches(newLines, [chunk.anchor], tier);
+            if (count === 1) {
+              cursor = idx + 1;
+              found = true;
+              break;
+            }
           }
         }
         if (!found) {
+          // Check if ambiguous
+          for (const tier of tiers) {
+            if (countMatches(newLines, [chunk.anchor], tier) > 1) {
+              return { success: false, error: { code: 'ambiguous', path: this.path } };
+            }
+          }
           return { success: false, error: { code: 'no-match', path: this.path } };
         }
       }
@@ -880,40 +860,47 @@ class V4AUpdateEdit {
         return { success: false, error: { code: 'no-match', path: this.path } };
       }
       
-      if (matchIdx < 0) {
-        // Check if ambiguous from cursor
-        for (const tier of tiers) {
-          if (countMatchesFrom(newLines, oldContext, cursor, tier) > 1) {
-            return { success: false, error: { code: 'ambiguous', path: this.path } };
+      // Replace oldContext with newContext - preserve indentation for tier 2/3
+      // For V4A, use newContext as-is (already has correct indentation)
+      newLines.splice(matchIdx, oldContext.length, ...newContext);
+      // Actually, we need to apply file's indentation to context lines for tier >= 2
+      if (matchedTier >= 2 && oldContext.length > 0 && newContext.length > 0) {
+        // Determine which lines are context (unchanged) vs changed
+        const isContextLine: boolean[] = [];
+        for (let i = 0; i < oldContext.length; i++) {
+          isContextLine.push(oldContext[i].trimStart() === newContext[i].trimStart());
+        }
+        
+        // Find typical indentation from context lines
+        let typicalIndent = '';
+        for (let i = 0; i < oldContext.length; i++) {
+          if (isContextLine[i]) {
+            const fileLine = newLines[matchIdx + i];
+            typicalIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
+            break;
           }
         }
-        return { success: false, error: { code: 'no-match', path: this.path } };
-      }
-      
-      // Replace oldContext with newContext
-      // Apply tier-based whitespace adjustment for tiers 2, 3
-      let adjustedNewContext = newContext;
-      if (matchedTier >= 2 && oldContext.length > 0 && newContext.length > 0) {
-        const fileLine = newLines[matchIdx];
-        const oldFirstLine = oldContext[0];
-        const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
-        const oldIndent = oldFirstLine.match(/^[ 	]*/)?.[0] || '';
         
-        // Compute relative indentation for each line in oldContext relative to oldFirstLine
-        const oldRelativeIndents = oldContext.map(line => {
-          const lineIndent = line.match(/^[ 	]*/)?.[0] || '';
-          return lineIndent.length - oldIndent.length;
-        });
-        
-        // Apply the same relative indentation to newContext using fileIndent as base
-        // For each line, use its own relative indent from oldContext
-        adjustedNewContext = newContext.map((line, i) => {
+        const adjustedNewContext = newContext.map((line, i) => {
           if (line === '' || line.trim() === '') return line;
-          const relativeIndent = i < oldRelativeIndents.length ? oldRelativeIndents[i] : 0;
-          return fileIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
+          const fileLine = newLines[matchIdx + i];
+          const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
+          const lineIndent = line.match(/^[ 	]*/)?.[0] || '';
+          
+          if (isContextLine[i]) {
+            // Context line: use file's indentation
+            return fileIndent + line.trimStart();
+          } else if (lineIndent.length === 0) {
+            // Changed line with no indentation: use typicalIndent if available, else fileIndent
+            const indent = typicalIndent || fileIndent;
+            return indent + line.trimStart();
+          } else {
+            // Changed line with its own indentation: keep it
+            return line;
+          }
         });
+        newLines.splice(matchIdx, oldContext.length, ...adjustedNewContext);
       }
-      newLines.splice(matchIdx, oldContext.length, ...adjustedNewContext);
       // Update cursor to track position in modified file for next chunk
       cursor = matchIdx + oldContext.length;
     }
@@ -973,7 +960,17 @@ function parseJsonEdits(text: string): Edit[] {
       throw new Error(`parse ${lineNum}`);
     }
   }
-  
+
+  for (let j = 0; j < lines.length; j++) {
+    if (lines[j].trim() === '*** End Patch') {
+      foundEndPatch = true;
+      break;
+    }
+  }
+  if (!foundEndPatch) {
+    throw new Error('parse 8');
+  }
+
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
@@ -994,7 +991,7 @@ function parseJsonEdit(obj: any): Edit {
     const newStr = obj.new_str ?? '';
     return new JsonStrReplaceEdit(path, obj.old_str, newStr);
   } else if (command === 'insert') {
-    if (typeof obj.insert_line !== 'number' || obj.insert_line < 0) throw new Error('parse 1');
+    if (typeof obj.insert_line !== 'number' || !Number.isInteger(obj.insert_line) || obj.insert_line < 0) throw new Error('parse 1');
     const newStr = obj.new_str ?? '';
     return new JsonInsertEdit(path, obj.insert_line, newStr);
   } else {
