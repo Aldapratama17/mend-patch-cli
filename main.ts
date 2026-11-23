@@ -354,7 +354,7 @@ for (const tier of tiers) {
         if (line.startsWith(' ') || line === '') {
           // Context line: preserve original file's line (including trailing whitespace)
           if (matchIdx + contextOffset < newLines.length) {
-            replacement.push(file.lines[matchIdx + contextOffset]);
+            replacement.push(newLines[matchIdx + contextOffset]);
           }
           contextOffset++;
           oldLinesConsumed++;
