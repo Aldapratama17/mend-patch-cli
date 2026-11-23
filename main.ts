@@ -321,11 +321,20 @@ class UnifiedDiffEdit {
         const searchStart = Math.max(cursor, (hunk.oldStart < 0 ? 0 : hunk.oldStart) - 50);        
         // Find all matches near oldStart
         const ambStart = Math.max(0, (hunk.oldStart < 0 ? 0 : hunk.oldStart) - 20);
-        const ambEnd = Math.min(newLines.length, ambStart + 60);
+        // If oldStart is beyond file length, search the whole file
+        let ambStartFinal: number;
+        let ambEndFinal: number;
+        if (hunk.oldStart >= newLines.length) {
+          ambStartFinal = 0;
+          ambEndFinal = newLines.length;
+        } else {
+          ambStartFinal = ambStart;
+          ambEndFinal = Math.min(newLines.length, ambStart + 60);
+        }
         
         for (const tier of tiers) {
           const matches: number[] = [];
-          for (let i = ambStart; i <= ambEnd - oldContext.length; i++) {
+          for (let i = ambStartFinal; i <= ambEndFinal - oldContext.length; i++) {
             let ok = true;
             for (let j = 0; j < oldContext.length; j++) {
               if (!compareLines(newLines[i + j], oldContext[j], tier)) {
@@ -769,7 +778,7 @@ class V4ADeleteEdit {
       return { success: false, error: { code: 'missing', path: this.path } };
     }
     
-    files.delete(this.path);
+    file.exists = false;
     return { success: true, changes: [{ type: 'delete', newPath: this.path }] };
   }
 }
@@ -831,12 +840,9 @@ class V4AUpdateEdit {
       const newContext: string[] = [];
       
       for (const line of chunk.bodyLines) {
-        if (line.startsWith(' ') || line.startsWith('-')) oldContext.push(line.slice(1).replace(/s+$/, ''));
-        if (line.startsWith(' ') || line.startsWith('+')) newContext.push(line.slice(1).replace(/s+$/, ''));
+        if (line.startsWith(' ') || line.startsWith('-')) oldContext.push(line.slice(1).replace(/\s+$/, ''));
+        if (line.startsWith(' ') || line.startsWith('+')) newContext.push(line.slice(1).replace(/\s+$/, ''));
       }
-      
-      console.error('OLD CONTEXT (trimmed): ' + JSON.stringify(oldContext));
-      console.error('NEW CONTEXT (trimmed): ' + JSON.stringify(newContext));
       
       if (oldContext.length === 0) {
         // Insert at cursor
@@ -892,15 +898,20 @@ class V4AUpdateEdit {
         const oldFirstLine = oldContext[0];
         const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
         const oldIndent = oldFirstLine.match(/^[ 	]*/)?.[0] || '';
-        if (oldIndent.length > 0) {
-          adjustedNewContext = newContext.map(line => {
-            if (line === '' || line.trim() === '') return line;
-            if (line.startsWith(oldIndent)) {
-              return fileIndent + line.slice(oldIndent.length);
-            }
-            return line;
-          });
-        }
+        
+        // Compute relative indentation for each line in oldContext relative to oldFirstLine
+        const oldRelativeIndents = oldContext.map(line => {
+          const lineIndent = line.match(/^[ 	]*/)?.[0] || '';
+          return lineIndent.length - oldIndent.length;
+        });
+        
+        // Apply the same relative indentation to newContext using fileIndent as base
+        // For each line, use its own relative indent from oldContext
+        adjustedNewContext = newContext.map((line, i) => {
+          if (line === '' || line.trim() === '') return line;
+          const relativeIndent = i < oldRelativeIndents.length ? oldRelativeIndents[i] : 0;
+          return fileIndent + ' '.repeat(Math.max(0, relativeIndent)) + line.trimStart();
+        });
       }
       newLines.splice(matchIdx, oldContext.length, ...adjustedNewContext);
       // Update cursor to track position in modified file for next chunk
