@@ -369,7 +369,7 @@ for (const tier of tiers) {
         if (line.startsWith(' ') || line === '') {
           // Context line: preserve original file's line (including trailing whitespace)
           if (matchIdx + contextOffset < newLines.length) {
-            replacement.push(file.lines[matchIdx + contextOffset]);
+            replacement.push(newLines[matchIdx + contextOffset]);
           }
           contextOffset++;
           oldLinesConsumed++;
@@ -840,7 +840,7 @@ class V4AUpdateEdit {
       if (chunk.endOfFile) {
         // Must match at end of file
         for (const tier of tiers) {
-          const idx = matchTier(newLines, oldContext, cursor, tier);
+          const idx = matchTierDebug(newLines, oldContext, cursor, tier);
           console.error('DEBUG tier=' + tier + ': matchTier idx=' + idx);
           if (idx >= 0 && idx + oldContext.length === newLines.length) {
             // Check uniqueness from cursor
