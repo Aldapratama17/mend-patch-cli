@@ -297,14 +297,18 @@ class UnifiedDiffEdit {
         if (matchIdx > newLines.length) matchIdx = newLines.length;
         matchedTier = 0;
       } else {
-        // Search from max(cursor, oldStart - context) to handle non-adjacent hunks
-        // IMPORTANT: Match against original file lines (file.lines), not modified newLines
-        const searchStart = Math.max(cursor, Math.max(0, hunk.oldStart - 50));
-        for (const tier of tiers) {
-          const idx = matchTier(file.lines, oldContext, searchStart, tier);
+        // Search from cursor position (which tracks where we are in the modified file)
+        // But hunk.oldStart is relative to the original file, so we need to adjust
+        // Use max(cursor, hunk.oldStart - 50) to handle non-adjacent hunks
+        // When hunk.oldStart is -1 (malformed @@ -0 @@), treat as 0
+        const searchStart = Math.max(cursor, Math.max(0, (hunk.oldStart < 0 ? 0 : hunk.oldStart) - 50));        
+
+for (const tier of tiers) {
+          // Search in newLines (current state) not file.lines (original)
+          const idx = matchTier(newLines, oldContext, searchStart, tier);
           if (idx >= 0) {
             // Check uniqueness at this tier
-            const count = countMatches(file.lines, oldContext, tier);
+            const count = countMatches(newLines, oldContext, tier);
             if (count === 1) {
               matchIdx = idx;
               matchedTier = tier;
@@ -329,8 +333,21 @@ class UnifiedDiffEdit {
       const replacement: string[] = [];
       let contextOffset = 0;
       let oldLinesConsumed = 0;
+      
+      // For tier >= 2, prepare indentation adjustment for inserted lines
+      let fileIndent = '';
+      let oldIndent = '';
+      if (matchedTier >= 2 && oldContext.length > 0) {
+        const fileLine = file.lines[matchIdx];
+        const oldFirstLine = oldContext[0];
+        fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
+        oldIndent = oldFirstLine.match(/^[ 	]*/)?.[0] || '';
+      }
+      
       for (const line of hunk.lines) {
-        if (oldLinesConsumed >= hunk.oldLines) break;
+        // Stop after consuming hunk.oldLines lines from the old file
+        // But always process '+' lines (insertions)
+        if (oldLinesConsumed >= hunk.oldLines && !line.startsWith('+')) break;
         
         if (line.startsWith(' ') || line === '') {
           // Context line: preserve original file's line (including trailing whitespace)
@@ -345,13 +362,23 @@ class UnifiedDiffEdit {
           oldLinesConsumed++;
         } else if (line.startsWith('+')) {
           // Inserted line: add new content, does NOT count toward oldLines
-          replacement.push(line.slice(1));
+          let newLine = line.slice(1);
+          // Adjust indentation for tiers 2, 3
+          if (matchedTier >= 2 && oldIndent.length > 0) {
+            if (newLine.startsWith(oldIndent)) {
+              newLine = fileIndent + newLine.slice(oldIndent.length);
+            }
+          }
+          replacement.push(newLine);
         }
       }
       
       // Use hunk.oldLines for the splice count
       newLines.splice(matchIdx, hunk.oldLines, ...replacement);
-      cursor = matchIdx + replacement.length;
+      // Update cursor to track position in modified file for next hunk
+      // cursor should be after the matched oldContext in the new file
+      // oldContext.length is the number of lines matched from original
+      cursor = matchIdx + oldContext.length;
     }
     
     // Check if file actually changed
@@ -369,7 +396,8 @@ class UnifiedDiffEdit {
       // Check if any hunk has noNewlineAtEnd to preserve that
       const endsWithBreak = !(this.hunks.some(h => h.noNewlineAtEnd));
       files.set(this.newPath, { ...file, lines: newLines, content: newContent, exists: true, endsWithBreak });
-      files.delete(path);
+      // Mark old path for deletion
+      file.exists = false;
       return { 
         success: true, 
         changes: [
@@ -810,8 +838,26 @@ class V4AUpdateEdit {
       }
       
       // Replace oldContext with newContext
-      newLines.splice(matchIdx, oldContext.length, ...newContext);
-      cursor = matchIdx + newContext.length;
+      // Apply tier-based whitespace adjustment for tiers 2, 3
+      let adjustedNewContext = newContext;
+      if (matchedTier >= 2 && oldContext.length > 0 && newContext.length > 0) {
+        const fileLine = newLines[matchIdx];
+        const oldFirstLine = oldContext[0];
+        const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
+        const oldIndent = oldFirstLine.match(/^[ 	]*/)?.[0] || '';
+        if (oldIndent.length > 0) {
+          adjustedNewContext = newContext.map(line => {
+            if (line === '' || line.trim() === '') return line;
+            if (line.startsWith(oldIndent)) {
+              return fileIndent + line.slice(oldIndent.length);
+            }
+            return line;
+          });
+        }
+      }
+      newLines.splice(matchIdx, oldContext.length, ...adjustedNewContext);
+      // Update cursor to track position in modified file for next chunk
+      cursor = matchIdx + oldContext.length;
     }
     
     const newContent = newLines.join(file.lineBreak) + (file.endsWithBreak ? file.lineBreak : '');
@@ -821,12 +867,12 @@ class V4AUpdateEdit {
     
     if (this.moveTo !== null) {
       files.set(this.moveTo, { ...file, lines: newLines, content: newContent, exists: true });
-      files.delete(this.path);
+      // Mark old path for deletion
+      file.exists = false;
       return { 
         success: true, 
         changes: [
-          { type: 'delete', newPath: this.path },
-          { type: 'create', newPath: this.moveTo, content: newContent, lineBreak: file.lineBreak, endsWithBreak: file.endsWithBreak }
+          { type: 'move', oldPath: this.path, newPath: this.moveTo, content: newContent, lineBreak: file.lineBreak, endsWithBreak: file.endsWithBreak }
         ]
       };
     }
