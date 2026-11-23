@@ -1,0 +1,11 @@
+node_modules/
+out*/
+node_modules/
+out*/
+test_*/
+package-lock.json
+package.json
+main.ts.bak
+label.py
+.makefun/
+main.ts
