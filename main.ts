@@ -373,8 +373,7 @@ class UnifiedDiffEdit {
       return { 
         success: true, 
         changes: [
-          { type: 'delete', newPath: path },
-          { type: 'create', newPath: this.newPath, content: newContent, lineBreak: file.lineBreak, endsWithBreak }
+          { type: 'move', oldPath: path, newPath: this.newPath, content: newContent, lineBreak: file.lineBreak, endsWithBreak }
         ]
       };
     }
