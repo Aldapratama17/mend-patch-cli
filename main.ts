@@ -140,6 +140,21 @@ function countMatches(lines: string[], target: string[], tier: Tier): number {
   return count;
 }
 
+function countMatchesFrom(lines: string[], target: string[], start: number, tier: Tier): number {
+  let count = 0;
+  for (let i = start; i <= lines.length - target.length; i++) {
+    let ok = true;
+    for (let j = 0; j < target.length; j++) {
+      if (!compareLines(lines[i + j], target[j], tier)) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) count++;
+  }
+  return count;
+}
+
 // ============================================================================
 // Unified diff parsing
 // ============================================================================
@@ -391,6 +406,11 @@ for (const tier of tiers) {
     
     // Handle move
     if (this.newPath !== this.oldPath && this.oldPath !== '/dev/null' && this.oldPath !== '') {
+      // Handle delete: newPath is /dev/null
+      if (this.newPath === '/dev/null' || this.newPath === '') {
+        file.exists = false;
+        return { success: true, changes: [{ type: 'delete', newPath: path }] };
+      }
       if (!isSafePath(this.newPath)) return { success: false, error: { code: 'unsafe', path: this.newPath } };
       if (existsSync(join(process.cwd(), this.newPath))) {
         return { success: false, error: { code: 'exists', path: this.newPath } };
@@ -660,7 +680,21 @@ function parseV4A(text: string): Edit[] {
       throw new Error(`parse ${i + 1}`);
     }
   }
-  
+
+  // Must have *** End Patch
+  let foundEndPatch = false;
+  for (let j = 0; j < lines.length; j++) {
+    if (lines[j].trim() === '*** End Patch') {
+      foundEndPatch = true;
+      break;
+    }
+  }
+  if (!foundEndPatch) {
+    // Count actual patch lines: number of \n in text, plus 1 if doesn't end with \n
+    const patchLines = text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length;
+    throw new Error(`parse ${patchLines + 1}`);
+  }
+
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
@@ -760,8 +794,8 @@ class V4AUpdateEdit {
         for (const tier of tiers) {
           const idx = matchTier(newLines, [chunk.anchor], cursor, tier);
           if (idx >= 0) {
-            // Check uniqueness
-            const count = countMatches(newLines, [chunk.anchor], tier);
+            // Check uniqueness from cursor onwards
+            const count = countMatchesFrom(newLines, [chunk.anchor], cursor, tier);
             if (count === 1) {
               cursor = idx + 1;
               found = true;
@@ -770,9 +804,9 @@ class V4AUpdateEdit {
           }
         }
         if (!found) {
-          // Check if ambiguous
+          // Check if ambiguous from cursor onwards
           for (const tier of tiers) {
-            if (countMatches(newLines, [chunk.anchor], tier) > 1) {
+            if (countMatchesFrom(newLines, [chunk.anchor], cursor, tier) > 1) {
               return { success: false, error: { code: 'ambiguous', path: this.path } };
             }
           }
@@ -800,13 +834,18 @@ class V4AUpdateEdit {
       let matchIdx = -1;
       let matchedTier: Tier = 0;
       
+      console.error('DEBUG: endOfFile=' + chunk.endOfFile + ', cursor=' + cursor + ', oldContext=' + JSON.stringify(oldContext) + ', newLines.length=' + newLines.length);
+      console.error('DEBUG newLines from cursor: ' + JSON.stringify(newLines.slice(cursor, cursor + 10)));
+      
       if (chunk.endOfFile) {
         // Must match at end of file
         for (const tier of tiers) {
           const idx = matchTier(newLines, oldContext, cursor, tier);
+          console.error('DEBUG tier=' + tier + ': matchTier idx=' + idx);
           if (idx >= 0 && idx + oldContext.length === newLines.length) {
-            // Check uniqueness
-            const count = countMatches(newLines, oldContext, tier);
+            // Check uniqueness from cursor
+            const count = countMatchesFrom(newLines, oldContext, cursor, tier);
+            console.error('DEBUG tier=' + tier + ': idx=' + idx + ', count=' + count);
             if (count === 1) {
               matchIdx = idx;
               matchedTier = tier;
@@ -817,9 +856,11 @@ class V4AUpdateEdit {
       } else {
         for (const tier of tiers) {
           const idx = matchTier(newLines, oldContext, cursor, tier);
+          console.error('DEBUG tier=' + tier + ': matchTier idx=' + idx);
           if (idx >= 0) {
-            // Check uniqueness
-            const count = countMatches(newLines, oldContext, tier);
+            // Check uniqueness from cursor
+            const count = countMatchesFrom(newLines, oldContext, cursor, tier);
+            console.error('DEBUG tier=' + tier + ': idx=' + idx + ', count=' + count);
             if (count === 1) {
               matchIdx = idx;
               matchedTier = tier;
@@ -830,9 +871,9 @@ class V4AUpdateEdit {
       }
       
       if (matchIdx < 0) {
-        // Check if ambiguous
+        // Check if ambiguous from cursor
         for (const tier of tiers) {
-          if (countMatches(newLines, oldContext, tier) > 1) {
+          if (countMatchesFrom(newLines, oldContext, cursor, tier) > 1) {
             return { success: false, error: { code: 'ambiguous', path: this.path } };
           }
         }
