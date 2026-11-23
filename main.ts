@@ -278,16 +278,13 @@ class UnifiedDiffEdit {
     for (const hunk of this.hunks) {
       // Find the hunk location using context lines
       const oldContext: string[] = [];
-      const newContext: string[] = [];
       
       for (const line of hunk.lines) {
         if (line.startsWith(' ') || line.startsWith('-') || line === '') oldContext.push(line === '' ? '' : line.slice(1));
-        if (line.startsWith(' ') || line.startsWith('+') || line === '') newContext.push(line === '' ? '' : line.slice(1));
       }
       
       // Trim trailing empty lines from context (they don't help matching)
       while (oldContext.length > 0 && oldContext[oldContext.length - 1] === '') oldContext.pop();
-      while (newContext.length > 0 && newContext[newContext.length - 1] === '') newContext.pop();
       
       // Try to find match at each tier
       let matchIdx = -1;
@@ -301,12 +298,13 @@ class UnifiedDiffEdit {
         matchedTier = 0;
       } else {
         // Search from max(cursor, oldStart - context) to handle non-adjacent hunks
+        // IMPORTANT: Match against original file lines (file.lines), not modified newLines
         const searchStart = Math.max(cursor, Math.max(0, hunk.oldStart - 50));
         for (const tier of tiers) {
-          const idx = matchTier(newLines, oldContext, searchStart, tier);
+          const idx = matchTier(file.lines, oldContext, searchStart, tier);
           if (idx >= 0) {
             // Check uniqueness at this tier
-            const count = countMatches(newLines, oldContext, tier);
+            const count = countMatches(file.lines, oldContext, tier);
             if (count === 1) {
               matchIdx = idx;
               matchedTier = tier;
@@ -319,16 +317,36 @@ class UnifiedDiffEdit {
       if (matchIdx < 0) {
         // Check if ambiguous at any tier
         for (const tier of tiers) {
-          if (countMatches(newLines, oldContext, tier) > 1) {
+          if (countMatches(file.lines, oldContext, tier) > 1) {
             return { success: false, error: { code: 'ambiguous', path } };
           }
         }
         return { success: false, error: { code: 'no-match', path } };
       }
       
-      // Replace oldContext with newContext
-      newLines.splice(matchIdx, oldContext.length, ...newContext);
-      cursor = matchIdx + newContext.length;
+      // Build replacement by iterating through hunk lines directly
+      // This correctly handles context lines (preserve original), deletions (skip), and insertions (add new)
+      const replacement: string[] = [];
+      let contextOffset = 0;
+      for (const line of hunk.lines) {
+        if (line.startsWith(' ') || line === '') {
+          // Context line: preserve original file's line (including trailing whitespace)
+          if (matchIdx + contextOffset < file.lines.length) {
+            replacement.push(file.lines[matchIdx + contextOffset]);
+          }
+          contextOffset++;
+        } else if (line.startsWith('-')) {
+          // Deleted line: skip, but advance context offset
+          contextOffset++;
+        } else if (line.startsWith('+')) {
+          // Inserted line: add new content
+          replacement.push(line.slice(1));
+        }
+      }
+      
+      // Use hunk.oldLines for the splice count (not oldContext.length which may be trimmed)
+      newLines.splice(matchIdx, hunk.oldLines, ...replacement);
+      cursor = matchIdx + replacement.length;
     }
     
     // Check if file actually changed
@@ -373,46 +391,46 @@ function parseSearchReplace(text: string): Edit[] {
   const lines = text.split('\n');
   const edits: Edit[] = [];
   let i = 0;
+  let lastPath = '';
   
   while (i < lines.length) {
-    // Find ```x or ```
-    if (!lines[i].startsWith('```')) { i++; continue; }
-    const fence = lines[i];
-    const lang = fence.slice(3).trim();
-    i++;
+    const trimmed = lines[i].trim();
     
-    if (i >= lines.length || !lines[i].startsWith('<<<<<<< SEARCH')) throw new Error(`parse ${i + 1}`);
-    i++;
-    
-    const oldLines: string[] = [];
-    while (i < lines.length && !lines[i].startsWith('=======')) {
-      oldLines.push(lines[i]);
+    if (trimmed.startsWith('<<<<<<< SEARCH')) {
+      // Found SEARCH - use the path captured before this block
+      const searchLine = i;
       i++;
-    }
-    if (i >= lines.length) throw new Error(`parse ${i + 1}`);
-    i++; // skip =======
-    
-    const newLines: string[] = []
-    while (i < lines.length && !lines[i].startsWith('>>>>>>> REPLACE')) {
-      newLines.push(lines[i]);
-      i++;
-    }
-    if (i >= lines.length) throw new Error(`parse ${i + 1}`);
-    i++; // skip >>>>>>> REPLACE
-    
-    if (i >= lines.length || !lines[i].startsWith('```')) throw new Error(`parse ${i + 1}`);
-    i++;
-    
-    // Extract path from first line of oldLines if it looks like a path
-    let path = '';
-    if (oldLines.length > 0 && oldLines[0].includes('/') && !oldLines[0].includes(' ') && !oldLines[0].startsWith('\t')) {
-      path = oldLines[0];
-      oldLines.shift();
+      
+      const oldLines: string[] = [];
+      while (i < lines.length && !lines[i].trim().startsWith('=======')) {
+        oldLines.push(lines[i]);
+        i++;
+      }
+      if (i >= lines.length) throw new Error(`parse ${searchLine + 1}`);
+      i++; // skip =======
+      
+      const newLines: string[] = [];
+      while (i < lines.length && !lines[i].trim().startsWith('>>>>>>> REPLACE')) {
+        newLines.push(lines[i]);
+        i++;
+      }
+      if (i >= lines.length) throw new Error(`parse ${searchLine + 1}`);
+      i++; // skip >>>>>>> REPLACE
+      
+      // Get the path: it's the nearest non-blank, non-fence line before SEARCH
+      let path = lastPath;
+      if (!path) {
+        throw new Error(`parse ${searchLine + 1}`);
+      }
+      
+      edits.push(new SearchReplaceEdit(path, oldLines, newLines));
     } else {
-      throw new Error(`parse ${i - oldLines.length - newLines.length - 4}`);
+      // Track potential path: non-blank line not starting with ```
+      if (trimmed !== '' && !trimmed.startsWith('```')) {
+        lastPath = trimmed;
+      }
+      i++;
     }
-    
-    edits.push(new SearchReplaceEdit(path, oldLines, newLines));
   }
   
   if (edits.length === 0) throw new Error('parse 1');
@@ -439,17 +457,37 @@ class SearchReplaceEdit {
       if (file) files.set(this.path, file);
     }
     
+    // Handle create file case (oldLines is empty)
+    if (this.oldLines.length === 0) {
+      if (file && file.exists) {
+        return { success: false, error: { code: 'exists', path: this.path } };
+      }
+      // Create new file with LF line breaks, ending with a line break
+      const newContent = this.newLines.join('\n') + '\n';
+      const newFile: FileState = {
+        content: newContent,
+        lines: this.newLines,
+        lineBreak: '\n',
+        endsWithBreak: true,
+        exists: true
+      };
+      files.set(this.path, newFile);
+      return { success: true, changes: [{ type: 'create', newPath: this.path, content: newContent, lineBreak: '\n', endsWithBreak: true }] };
+    }
+    
     if (!file || !file.exists) {
       return { success: false, error: { code: 'missing', path: this.path } };
     }
     
     const tiers: Tier[] = [0, 1, 2, 3];
     let matchIdx = -1;
+    let matchTierFound: Tier = 0;
     
     for (const tier of tiers) {
       const count = countMatches(file.lines, this.oldLines, tier);
       if (count === 1) {
         matchIdx = matchTier(file.lines, this.oldLines, 0, tier);
+        matchTierFound = tier;
         break;
       } else if (count > 1) {
         return { success: false, error: { code: 'ambiguous', path: this.path } };
@@ -460,8 +498,33 @@ class SearchReplaceEdit {
       return { success: false, error: { code: 'no-match', path: this.path } };
     }
     
+    // Apply tier-based whitespace adjustment for tiers 2, 3, 4
+    // At tiers 0 and 1 the lines of N are written as they are.
+    // At tiers 2, 3, 4, leading whitespace of N lines starting with P is replaced with F
+    // where F = leading whitespace of file's first matched line
+    //       P = leading whitespace of O's first line
+    let adjustedNewLines = this.newLines;
+    if (matchTierFound >= 2 && this.oldLines.length > 0 && this.newLines.length > 0) {
+      const fileLine = file.lines[matchIdx];
+      const oldFirstLine = this.oldLines[0];
+      
+      // Get leading whitespace
+      const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
+      const oldIndent = oldFirstLine.match(/^[ 	]*/)?.[0] || '';
+      
+      if (oldIndent.length > 0) {
+        adjustedNewLines = this.newLines.map(line => {
+          if (line === '' || line.trim() === '') return line;
+          if (line.startsWith(oldIndent)) {
+            return fileIndent + line.slice(oldIndent.length);
+          }
+          return line;
+        });
+      }
+    }
+    
     const newFileLines = [...file.lines];
-    newFileLines.splice(matchIdx, this.oldLines.length, ...this.newLines);
+    newFileLines.splice(matchIdx, this.oldLines.length, ...adjustedNewLines);
     const newContent = newFileLines.join(file.lineBreak) + (file.endsWithBreak ? file.lineBreak : '');
     
     if (newContent === file.content) {
@@ -473,7 +536,6 @@ class SearchReplaceEdit {
     return { success: true, changes: [{ type: 'modify', newPath: this.path, content: newContent, lineBreak: file.lineBreak, endsWithBreak: file.endsWithBreak }] };
   }
 }
-
 // ============================================================================
 // V4A parsing
 // ============================================================================
@@ -1000,8 +1062,8 @@ function detectFormat(text: string): string {
   const trimmed = text.trim();
   if (trimmed.startsWith('[') || trimmed.startsWith('{')) return 'json';
   
-  // Check for search-replace (fenced)
-  if (text.includes('```') && text.includes('<<<<<<< SEARCH')) return 'search-replace';
+  // Check for search-replace (fenced or plain)
+  if (text.includes('<<<<<<< SEARCH')) return 'search-replace';
   
   // Check for unified diff - need both --- and +++ or valid diff --git with following --- +++
   let hasDiffGit = false;
