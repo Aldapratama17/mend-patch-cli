@@ -42,7 +42,10 @@ type Tier = 0 | 1 | 2 | 3 | 4;
 // ============================================================================
 
 function isSafePath(path: string): boolean {
-  if (!path || path.startsWith('/') || path.includes('\\')) return false;
+  if (!path) return false;
+  // Allow /dev/null as special marker in unified diffs
+  if (path === '/dev/null') return true;
+  if (path.startsWith('/') || path.includes('\\')) return false;
   const segments = path.split('/');
   for (const seg of segments) {
     if (!seg || seg === '.' || seg === '..') return false;
@@ -115,9 +118,9 @@ function matchTier(lines: string[], target: string[], start: number, tier: Tier)
 
 function compareLines(a: string, b: string, tier: Tier): boolean {
   if (tier === 0) return a === b;
-  if (tier === 1) return a.trim() === b.trim();
+  if (tier === 1) return a.replace(/\s+$/, '') === b.replace(/\s+$/, '');
   if (tier === 2) return a.trimStart() === b.trimStart();
-  if (tier === 3) return a.replace(/^\s*/, '') === b.replace(/^\s*/, '');
+  if (tier === 3) return a.replace(/\s/g, '') === b.replace(/\s/g, '');
   return false;
 }
 
@@ -194,6 +197,10 @@ function parseUnifiedDiff(text: string): Edit[] {
           i++;
           continue;
         }
+        // Hunk lines must start with ' ', '-', '+', or be empty
+        if (!lines[i].startsWith(' ') && !lines[i].startsWith('-') && !lines[i].startsWith('+') && lines[i] !== '') {
+          break;
+        }
         hunkLines.push(lines[i]);
         i++;
       }
@@ -233,9 +240,10 @@ class UnifiedDiffEdit {
       if (file) files.set(path, file);
     }
     
-    const isCreate = !file || !file.exists;
+    const isCreate = this.oldPath === '/dev/null' || this.oldPath === '';
     if (isCreate) {
-      if (existsSync(join(process.cwd(), path))) {
+      // Creating new file - must not exist
+      if (existsSync(join(process.cwd(), path)) || (file && file.exists)) {
         return { success: false, error: { code: 'exists', path } };
       }
       // Create new file from hunks
@@ -254,6 +262,11 @@ class UnifiedDiffEdit {
       
       files.set(path, { content: '', lines: newLines, lineBreak, endsWithBreak, exists: true });
       return { success: true, changes: [{ type: 'create', newPath: path, content: newLines.join(lineBreak) + (endsWithBreak ? lineBreak : ''), lineBreak, endsWithBreak }] };
+    } else {
+      // Modifying existing file - must exist
+      if (!file || !file.exists) {
+        return { success: false, error: { code: 'missing', path } };
+      }
     }
     
     // Apply hunks to existing file
@@ -267,9 +280,13 @@ class UnifiedDiffEdit {
       const newContext: string[] = [];
       
       for (const line of hunk.lines) {
-        if (line.startsWith(' ') || line.startsWith('-')) oldContext.push(line.slice(1));
-        if (line.startsWith(' ') || line.startsWith('+')) newContext.push(line.slice(1));
+        if (line.startsWith(' ') || line.startsWith('-') || line === '') oldContext.push(line === '' ? '' : line.slice(1));
+        if (line.startsWith(' ') || line.startsWith('+') || line === '') newContext.push(line === '' ? '' : line.slice(1));
       }
+      
+      // Trim trailing empty lines from context (they don't help matching)
+      while (oldContext.length > 0 && oldContext[oldContext.length - 1] === '') oldContext.pop();
+      while (newContext.length > 0 && newContext[newContext.length - 1] === '') newContext.pop();
       
       // Try to find match at each tier
       let matchIdx = -1;
@@ -282,8 +299,10 @@ class UnifiedDiffEdit {
         if (matchIdx > newLines.length) matchIdx = newLines.length;
         matchedTier = 0;
       } else {
+        // Search from max(cursor, oldStart - context) to handle non-adjacent hunks
+        const searchStart = Math.max(cursor, Math.max(0, hunk.oldStart - 50));
         for (const tier of tiers) {
-          const idx = matchTier(newLines, oldContext, cursor, tier);
+          const idx = matchTier(newLines, oldContext, searchStart, tier);
           if (idx >= 0) {
             // Check uniqueness at this tier
             const count = countMatches(newLines, oldContext, tier);
@@ -983,10 +1002,21 @@ function detectFormat(text: string): string {
   // Check for search-replace (fenced)
   if (text.includes('```') && text.includes('<<<<<<< SEARCH')) return 'search-replace';
   
-  // Check for unified diff
+  // Check for unified diff - need both --- and +++ or valid diff --git with following --- +++
+  let hasDiffGit = false;
+  let hasOld = false;
+  let hasNew = false;
   for (const line of lines) {
-    if (line.startsWith('--- ') || line.startsWith('diff --git ')) return 'unified';
+    if (line.startsWith('diff --git ')) {
+      hasDiffGit = true;
+    } else if (line.startsWith('--- ')) {
+      hasOld = true;
+    } else if (line.startsWith('+++ ')) {
+      hasNew = true;
+    }
   }
+  if (hasDiffGit && hasOld && hasNew) return 'unified';
+  if (!hasDiffGit && hasOld && hasNew) return 'unified';
   
   return 'none';
 }
