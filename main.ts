@@ -9,7 +9,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 // ============================================================================
 
 interface Edit {
-  apply(files: Map<string, FileState>): EditResult;
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult;
 }
 
 interface EditResult {
@@ -230,7 +230,7 @@ class UnifiedDiffEdit {
     this.hunks = hunks;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     const path = this.oldPath === '/dev/null' || this.oldPath === '' ? this.newPath : this.oldPath;
     if (!isSafePath(path)) return { success: false, error: { code: 'unsafe', path } };
     
@@ -271,7 +271,7 @@ class UnifiedDiffEdit {
     }
     
     // Apply hunks to existing file
-    const tiers: Tier[] = [0, 1, 2, 3];
+    const tiers: Tier[] = strict ? [0] : [0, 1, 2, 3];
     const newLines = [...file.lines];
     let cursor = 0;
     
@@ -514,7 +514,7 @@ class SearchReplaceEdit {
     this.newLines = newLines;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     let file = files.get(this.path);
@@ -726,7 +726,7 @@ class V4AAddEdit {
     this.fileLines = fileLines;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     if (existsSync(join(process.cwd(), this.path))) {
@@ -746,7 +746,7 @@ class V4ADeleteEdit {
     this.path = path;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     let file = files.get(this.path);
@@ -775,7 +775,7 @@ class V4AUpdateEdit {
     this.chunks = chunks;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     let file = files.get(this.path);
@@ -795,7 +795,7 @@ class V4AUpdateEdit {
       }
     }
     
-    const tiers: Tier[] = [0, 1, 2, 3];
+    const tiers: Tier[] = strict ? [0] : [0, 1, 2, 3];
     const newLines = [...file.lines];
     let cursor = 0;
     
@@ -827,12 +827,32 @@ class V4AUpdateEdit {
       }
       
       // Extract old and new lines from chunk
+      // Track which lines in chunk are context (start with ' ') vs changed (start with '-' or '+')
+      const chunkIsContextLine: boolean[] = [];
       const oldContext: string[] = [];
       const newContext: string[] = [];
       
       for (const line of chunk.bodyLines) {
-        if (line.startsWith(' ') || line.startsWith('-')) oldContext.push(line.slice(1).replace(/\s+$/, ''));
-        if (line.startsWith(' ') || line.startsWith('+')) newContext.push(line.slice(1).replace(/\s+$/, ''));
+        const isContext = line.startsWith(' ');
+        chunkIsContextLine.push(isContext);
+        if (isContext || line.startsWith('-')) oldContext.push(line.slice(1).replace(/\s+$/, ''));
+        if (isContext || line.startsWith('+')) newContext.push(line.slice(1).replace(/\s+$/, ''));
+      }
+      
+      // Map chunk context lines to newContext indices
+      const isContextLine: boolean[] = [];
+      let chunkIdx = 0;
+      for (let i = 0; i < newContext.length; i++) {
+        // Find the chunk line that produced this newContext entry
+        while (chunkIdx < chunk.bodyLines.length) {
+          const line = chunk.bodyLines[chunkIdx];
+          const producesNew = line.startsWith(' ') || line.startsWith('+');
+          chunkIdx++;
+          if (producesNew) {
+            isContextLine.push(chunkIsContextLine[chunkIdx - 1]);
+            break;
+          }
+        }
       }
       
       if (oldContext.length === 0) {
@@ -872,34 +892,36 @@ class V4AUpdateEdit {
       }
       
       // Replace oldContext with newContext - preserve indentation for tier 2/3
-      // For V4A, use newContext as-is (already has correct indentation)
-      newLines.splice(matchIdx, oldContext.length, ...newContext);
-      // Actually, we need to apply file's indentation to context lines for tier >= 2
-      // Changed lines keep patch's indentation
+      // For V4A: per SPEC section 5, at tier 2:
+      // - F = leading whitespace of file's first matched line
+      // - P = leading whitespace of O's first line
+      // - Context line (in both O and N with same trimmed content): write as file's matched line
+      // - Non-context line of N that starts with P: replace P with F
+      // - Other lines: write as-is
       if (matchedTier >= 2 && oldContext.length > 0 && newContext.length > 0) {
-        // Determine which lines are context (unchanged) vs changed
-        const isContextLine: boolean[] = [];
-        for (let i = 0; i < oldContext.length; i++) {
-          // Context if exact match (content AND indentation)
-          isContextLine.push(oldContext[i] === newContext[i]);
-        }
+        const fileFirstLine = file.lines[matchIdx];
+        const F = fileFirstLine.match(/^[ \t]*/)?.[0] || '';
+        const P = oldContext[0].match(/^[ \t]*/)?.[0] || '';
         
-        const adjustedNewContext = newContext.map((line, i) => {
+        // isContextLine is already built during extraction, aligned with newContext
+        
+        const adjustedNewContext = newContext.map((line, j) => {
           if (line === '' || line.trim() === '') return line;
-          const fileLine = file.lines[matchIdx + i];
-          const fileIndent = fileLine.match(/^[ \t]*/)?.[0] || '';
-          const lineIndent = line.match(/^[ \t]*/)?.[0] || '';
-          
-          if (isContextLine[i]) {
-            // Context line: use file's indentation
-            return fileIndent + line.trimStart();
+          if (isContextLine[j]) {
+            // Context line: write as the file's matched line (never the patch's)
+            return file.lines[matchIdx + j];
           } else {
-            // Changed line: use patch's indentation as-is (no added indent)
-            // The patch explicitly specifies the desired indentation
-            return line;
+            // Changed line: if starts with P, replace P with F
+            if (line.startsWith(P)) {
+              return F + line.slice(P.length);
+            } else {
+              return line; // Written as-is
+            }
           }
         });
         newLines.splice(matchIdx, oldContext.length, ...adjustedNewContext);
+      } else {
+        newLines.splice(matchIdx, oldContext.length, ...newContext);
       }
       // Update cursor to track position in modified file for next chunk
       cursor = matchIdx + oldContext.length;
@@ -961,16 +983,6 @@ function parseJsonEdits(text: string): Edit[] {
     }
   }
 
-  for (let j = 0; j < lines.length; j++) {
-    if (lines[j].trim() === '*** End Patch') {
-      foundEndPatch = true;
-      break;
-    }
-  }
-  if (!foundEndPatch) {
-    throw new Error('parse 8');
-  }
-
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
@@ -1008,7 +1020,7 @@ class JsonCreateEdit {
     this.fileText = fileText;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     if (existsSync(join(process.cwd(), this.path))) {
@@ -1038,7 +1050,7 @@ class JsonStrReplaceEdit {
     this.newStr = newStr;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     let file = files.get(this.path);
@@ -1113,7 +1125,7 @@ class JsonInsertEdit {
     this.newStr = newStr;
   }
   
-  apply(files: Map<string, FileState>): EditResult {
+  apply(files: Map<string, FileState>, strict?: boolean): EditResult {
     if (!isSafePath(this.path)) return { success: false, error: { code: 'unsafe', path: this.path } };
     
     let file = files.get(this.path);
@@ -1316,10 +1328,9 @@ async function main() {
   const allChanges: FileChange[] = [];
   
   // For strict mode, we only use tier 0
-  // We'll need to pass this to the edits
   
   for (const edit of edits) {
-    const result = edit.apply(files);
+    const result = edit.apply(files, strict);
     if (!result.success && result.error) {
       errors.push(result.error);
     }
