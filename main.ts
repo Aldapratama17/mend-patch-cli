@@ -874,7 +874,7 @@ class V4AUpdateEdit {
       // Replace oldContext with newContext - preserve indentation for tier 2/3
       // For V4A, use newContext as-is (already has correct indentation)
       newLines.splice(matchIdx, oldContext.length, ...newContext);
-      // Actually, we need to apply file's indentation to context lines for tier >= 2
+      // Actually, we need to apply file's indentation to changed lines with no indentation for tier >= 2
       if (matchedTier >= 2 && oldContext.length > 0 && newContext.length > 0) {
         // Determine which lines are context (unchanged) vs changed
         const isContextLine: boolean[] = [];
@@ -882,31 +882,18 @@ class V4AUpdateEdit {
           isContextLine.push(oldContext[i].trimStart() === newContext[i].trimStart());
         }
         
-        // Find typical indentation from context lines
-        let typicalIndent = '';
-        for (let i = 0; i < oldContext.length; i++) {
-          if (isContextLine[i]) {
-            const fileLine = file.lines[matchIdx + i];
-            typicalIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
-            break;
-          }
-        }
-        
         const adjustedNewContext = newContext.map((line, i) => {
           if (line === '' || line.trim() === '') return line;
           const fileLine = file.lines[matchIdx + i];
-          const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
-          const lineIndent = line.match(/^[ 	]*/)?.[0] || '';
+          const fileIndent = fileLine.match(/^[ \t]*/)?.[0] || '';
+          const lineIndent = line.match(/^[ \t]*/)?.[0] || '';
           
           if (isContextLine[i]) {
-            // Context line: use file's indentation
-            return fileIndent + line.trimStart();
-          } else if (lineIndent.length === 0) {
-            // Changed line with no indentation: use typicalIndent if available, else fileIndent
-            const indent = typicalIndent || fileIndent;
-            return indent + line.trimStart();
+            // Context line: use patch's indentation (already in line)
+            return line;
           } else {
-            // Changed line with its own indentation: keep it
+            // Changed line: use patch's indentation as-is (no added indent)
+            // The patch explicitly specifies the desired indentation
             return line;
           }
         });
