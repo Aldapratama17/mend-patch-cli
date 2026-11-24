@@ -441,8 +441,13 @@ function parseUnifiedDiff(text: string): UnifiedFileEdit[] {
       }
       
       // Parse hunk header: @@ -oldStart,oldCount +newStart,newCount @@
+      // SPEC: "any other line starting with @@ is error: parse <its line>"
       const hunkMatch = lines[i].match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
       if (!hunkMatch) {
+        // Any line starting with @@ that doesn't match proper format is a parse error
+        if (lines[i].startsWith('@@')) {
+          throw new Error(`parse ${i + 1}`);
+        }
         // Not a hunk header - skip trailing text and continue to next file
         i++;
         continue;
@@ -499,12 +504,29 @@ function parseUnifiedDiff(text: string): UnifiedFileEdit[] {
           newLineToOldLineIndex.push(oldLineIdx);
           oldLineIdx++;
         } else {
-          // Bare diff: line without prefix - treat as context
-          oldLines.push(line);
-          newLines.push(line);
-          newLineTypes.push('context');
-          newLineToOldLineIndex.push(oldLineIdx);
-          oldLineIdx++;
+          // Bare diff: line without prefix - could be context, added, or changed
+          // Bare lines after explicit + lines are treated as added, not changed
+          // Only match to deleted lines if NO explicit + lines have been seen
+          const hasExplicitAdded = newLineTypes.some(t => t === 'added' || t === 'changed');
+          const addedSoFar = newLineTypes.filter(t => t === 'added' || t === 'changed').length;
+          if (!hasExplicitAdded && addedSoFar < deletedOldIndices.length) {
+            // No explicit + lines yet - match to deleted line (changed)
+            newLines.push(line);
+            newLineTypes.push('changed');
+            newLineToOldLineIndex.push(deletedOldIndices[addedSoFar]);
+          } else if (oldLines.length >= oldCount) {
+            // oldCount filled, treat as added
+            newLines.push(line);
+            newLineTypes.push('added');
+            newLineToOldLineIndex.push(-1);
+          } else {
+            // Otherwise context
+            oldLines.push(line);
+            newLines.push(line);
+            newLineTypes.push('context');
+            newLineToOldLineIndex.push(oldLineIdx);
+            oldLineIdx++;
+          }
         }
         i++;
       }
