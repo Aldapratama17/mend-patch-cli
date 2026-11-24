@@ -1,5 +1,5 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -141,18 +141,8 @@ function countMatches(lines: string[], target: string[], tier: Tier): number {
 }
 
 // ============================================================================
-// Format parsers
+// Unified diff parsing
 // ============================================================================
-
-// --- Unified diff parsing ---
-interface UnifiedHunk {
-  oldStart: number;
-  oldLines: number;
-  newStart: number;
-  newLines: number;
-  lines: string[];
-  noNewlineAtEnd?: boolean;
-}
 
 function parseUnifiedDiff(text: string): Edit[] {
   const lines = text.split('\n');
@@ -189,7 +179,7 @@ function parseUnifiedDiff(text: string): Edit[] {
     i++;
     
     // Parse hunks
-    const hunks: UnifiedHunk[] = [];
+    const hunks: { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[]; noNewlineAtEnd?: boolean }[] = [];
     while (i < lines.length && lines[i].startsWith('@@ ')) {
       const hunkLine = lines[i];
       i++;
@@ -232,9 +222,9 @@ function parseUnifiedDiff(text: string): Edit[] {
 class UnifiedDiffEdit {
   oldPath: string;
   newPath: string;
-  hunks: UnifiedHunk[];
+  hunks: { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[]; noNewlineAtEnd?: boolean }[];
   
-  constructor(oldPath: string, newPath: string, hunks: UnifiedHunk[]) {
+  constructor(oldPath: string, newPath: string, hunks: { oldStart: number; oldLines: number; newStart: number; newLines: number; lines: string[]; noNewlineAtEnd?: boolean }[]) {
     this.oldPath = oldPath;
     this.newPath = newPath;
     this.hunks = hunks;
@@ -459,7 +449,10 @@ class UnifiedDiffEdit {
   }
 }
 
-// --- Search/Replace parsing (unfenced) ---
+// ============================================================================
+// SEARCH/REPLACE parsing
+// ============================================================================
+
 function parseSearchReplace(text: string): Edit[] {
   const lines = text.split('\n');
   const edits: Edit[] = [];
@@ -609,13 +602,9 @@ class SearchReplaceEdit {
     return { success: true, changes: [{ type: 'modify', newPath: this.path, content: newContent, lineBreak: file.lineBreak, endsWithBreak: file.endsWithBreak }] };
   }
 }
-
-// --- V4A parsing ---
-interface V4AChunk {
-  anchor: string;
-  bodyLines: string[];
-  endOfFile: boolean;
-}
+// ============================================================================
+// V4A parsing
+// ============================================================================
 
 function parseV4A(text: string): Edit[] {
   const lines = text.split('\n');
@@ -720,6 +709,12 @@ function parseV4A(text: string): Edit[] {
   }
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
+}
+
+interface V4AChunk {
+  anchor: string;
+  bodyLines: string[];
+  endOfFile: boolean;
 }
 
 class V4AAddEdit {
@@ -896,11 +891,6 @@ class V4AUpdateEdit {
         return { success: false, error: { code: 'no-match', path: this.path } };
       }
       
-      // Verify uniqueness at matched tier
-      if (countMatches(newLines, oldContext, matchedTier) > 1) {
-        return { success: false, error: { code: 'ambiguous', path: this.path } };
-      }
-      
       // Replace oldContext with newContext - preserve indentation for tier 2/3
       // For V4A: per SPEC section 5, at tier 2:
       // - F = leading whitespace of file's first matched line
@@ -960,7 +950,10 @@ class V4AUpdateEdit {
   }
 }
 
-// --- JSON edits parsing ---
+// ============================================================================
+// JSON parsing
+// ============================================================================
+
 function parseJsonEdits(text: string): Edit[] {
   const lines = text.split('\n');
   const edits: Edit[] = [];
@@ -989,7 +982,7 @@ function parseJsonEdits(text: string): Edit[] {
       throw new Error(`parse ${lineNum}`);
     }
   }
-  
+
   if (edits.length === 0) throw new Error('parse 1');
   return edits;
 }
@@ -1149,16 +1142,21 @@ class JsonInsertEdit {
       return { success: false, error: { code: 'no-match', path: this.path } };
     }
     
-    // Split new_str into lines (split at \n, each with one trailing \n removed)
-    const newLines = this.newStr.split('\n');
-    const lastNewLine = newLines[newLines.length - 1];
-    if (lastNewLine === '' && this.newStr.endsWith('\n')) {
+    // Split new_str into lines (split at \n, each with one trailing \r removed, without the empty piece after a final \n)
+    let newLines = this.newStr.split('\n').map(l => l.endsWith('\r') ? l.slice(0, -1) : l);
+    // Remove empty piece after final \n
+    if (this.newStr.endsWith('\n') && newLines.length > 0 && newLines[newLines.length - 1] === '') {
       newLines.pop();
     }
     
     const newFileLines = [...file.lines];
     newFileLines.splice(this.insertLine, 0, ...newLines);
+    
     const newContent = newFileLines.join(file.lineBreak) + (file.endsWithBreak ? file.lineBreak : '');
+    
+    if (newContent === file.content) {
+      return { success: true, changes: [] };
+    }
     
     file.lines = newFileLines;
     file.content = newContent;
@@ -1266,11 +1264,7 @@ function parseArgs(args: string[]): ParsedArgs {
   return result;
 }
 
-// ============================================================================
-// CLI entry point
-// ============================================================================
-
-async function main(): Promise<void> {
+async function main() {
   let format: string;
   let check: boolean;
   let strict: boolean;
@@ -1282,7 +1276,7 @@ async function main(): Promise<void> {
     check = parsed.check;
     strict = parsed.strict;
     patchFile = parsed.patchFile;
-  } catch {
+  } catch (e) {
     console.log('error: usage');
     process.exit(2);
   }
@@ -1334,7 +1328,6 @@ async function main(): Promise<void> {
   const allChanges: FileChange[] = [];
   
   // For strict mode, we only use tier 0
-  // We'll need to pass this to the edits
   
   for (const edit of edits) {
     const result = edit.apply(files, strict);
@@ -1383,7 +1376,7 @@ async function main(): Promise<void> {
       // Don't output D and A for moved files
       continue;
     }
-
+    
     // Check if this path was deleted as part of a move
     let isMoveDelete = false;
     for (const [newP, oldP] of moveMap) {
