@@ -874,12 +874,14 @@ class V4AUpdateEdit {
       // Replace oldContext with newContext - preserve indentation for tier 2/3
       // For V4A, use newContext as-is (already has correct indentation)
       newLines.splice(matchIdx, oldContext.length, ...newContext);
-      // Actually, we need to apply file's indentation to changed lines with no indentation for tier >= 2
+      // Actually, we need to apply file's indentation to context lines for tier >= 2
+      // Changed lines keep patch's indentation
       if (matchedTier >= 2 && oldContext.length > 0 && newContext.length > 0) {
         // Determine which lines are context (unchanged) vs changed
         const isContextLine: boolean[] = [];
         for (let i = 0; i < oldContext.length; i++) {
-          isContextLine.push(oldContext[i].trimStart() === newContext[i].trimStart());
+          // Context if exact match (content AND indentation)
+          isContextLine.push(oldContext[i] === newContext[i]);
         }
         
         const adjustedNewContext = newContext.map((line, i) => {
@@ -889,8 +891,8 @@ class V4AUpdateEdit {
           const lineIndent = line.match(/^[ \t]*/)?.[0] || '';
           
           if (isContextLine[i]) {
-            // Context line: use patch's indentation (already in line)
-            return line;
+            // Context line: use file's indentation
+            return fileIndent + line.trimStart();
           } else {
             // Changed line: use patch's indentation as-is (no added indent)
             // The patch explicitly specifies the desired indentation
