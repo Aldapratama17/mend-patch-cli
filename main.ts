@@ -886,7 +886,7 @@ class V4AUpdateEdit {
         let typicalIndent = '';
         for (let i = 0; i < oldContext.length; i++) {
           if (isContextLine[i]) {
-            const fileLine = newLines[matchIdx + i];
+            const fileLine = file.lines[matchIdx + i];
             typicalIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
             break;
           }
@@ -894,7 +894,7 @@ class V4AUpdateEdit {
         
         const adjustedNewContext = newContext.map((line, i) => {
           if (line === '' || line.trim() === '') return line;
-          const fileLine = newLines[matchIdx + i];
+          const fileLine = file.lines[matchIdx + i];
           const fileIndent = fileLine.match(/^[ 	]*/)?.[0] || '';
           const lineIndent = line.match(/^[ 	]*/)?.[0] || '';
           
